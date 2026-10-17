@@ -813,7 +813,30 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void gdaki_rma_thread(
             tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_THREAD>();
         }
 
-        int num_wqes = num_wqes_per_cmd * tg_size + (need_additional_wqe ? 1 : 0);
+        // Adjacent plain NBI PUT chunks can share one write without changing
+        // per-lane pointer advancement. Keep region operations and all other
+        // layouts on their existing descriptor path.
+        bool combine_data = false;
+        if constexpr (channel_op == NVSHMEMI_OP_PUT && nbi && !REGION_OPERATION) {
+            if (can_coalesce_warp) {
+                const size_t first_size = __shfl_sync(amask, transfer_size, 0);
+                const uint64_t first_lptr = __shfl_sync(amask, lptr, 0);
+                const uint64_t first_raddr = __shfl_sync(amask, raddr, 0);
+                const __be32 first_lkey = __shfl_sync(amask, lkey, 0);
+                const __be32 first_rkey = __shfl_sync(amask, rkey, 0);
+                const int first_sysmem = __shfl_sync(amask, (int)is_data_buf_in_sysmem, 0);
+                const int first_pe = __shfl_sync(amask, dst_pe, 0);
+                combine_data = __all_sync(
+                    amask, dst_pe == first_pe && transfer_size == first_size &&
+                               first_size <= (size_t)GDAKI_MAX_TRANSFER_SIZE / tg_size &&
+                               lptr == first_lptr + (size_t)my_tid * first_size &&
+                               raddr == first_raddr + (size_t)my_tid * first_size &&
+                               lkey == first_lkey && rkey == first_rkey &&
+                               (int)is_data_buf_in_sysmem == first_sysmem);
+            }
+        }
+        int num_wqes = num_wqes_per_cmd * (combine_data ? 1 : tg_size) +
+                       (need_additional_wqe ? 1 : 0);
 
         uint64_t base_wqe_idx;
 
@@ -829,7 +852,7 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void gdaki_rma_thread(
             base_wqe_idx = __shfl_sync(amask, base_wqe_idx, 0);
         }
 
-        uint64_t my_wqe_idx = base_wqe_idx + (my_tid * num_wqes_per_cmd);
+        uint64_t my_wqe_idx = base_wqe_idx + (combine_data ? 0 : my_tid * num_wqes_per_cmd);
 
         // RC always 1 WQE for write/read
         struct doca_gpu_dev_verbs_wqe *wqe_ptr;
@@ -837,15 +860,18 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void gdaki_rma_thread(
 
         // Generate CQE only if we create the last WQE in the group.
         enum doca_gpu_dev_verbs_wqe_ctrl_flags fm_ce_se =
-            (!need_additional_wqe && (my_tid == tg_size - 1))
+            (!need_additional_wqe && (combine_data || my_tid == tg_size - 1))
                 ? DOCA_GPUNETIO_IB_MLX5_WQE_CTRL_CQ_UPDATE
                 : DOCA_GPUNETIO_IB_MLX5_WQE_CTRL_CQ_ERROR_UPDATE;
 
         switch (channel_op) {
             case NVSHMEMI_OP_PUT:
-                doca_gpu_dev_verbs_wqe_prepare_write(
-                    &(qp->qp), wqe_ptr, my_wqe_idx, DOCA_GPUNETIO_IB_MLX5_OPCODE_RDMA_WRITE,
-                    fm_ce_se, 0, raddr, rkey, lptr, lkey, transfer_size);
+                if (!combine_data || my_tid == 0) {
+                    doca_gpu_dev_verbs_wqe_prepare_write(
+                        &(qp->qp), wqe_ptr, my_wqe_idx, DOCA_GPUNETIO_IB_MLX5_OPCODE_RDMA_WRITE,
+                        fm_ce_se, 0, raddr, rkey, lptr, lkey,
+                        transfer_size * (combine_data ? tg_size : 1));
+                }
                 break;
             case NVSHMEMI_OP_GET:
                 doca_gpu_dev_verbs_wqe_prepare_read(&(qp->qp), wqe_ptr, my_wqe_idx, fm_ce_se, raddr,
