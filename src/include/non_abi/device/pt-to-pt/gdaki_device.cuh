@@ -813,6 +813,9 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void gdaki_rma_thread(
             tg_size = nvshmemi_threadgroup_size<NVSHMEMI_THREADGROUP_THREAD>();
         }
 
+        // Adjacent plain NBI PUT chunks can share one write without changing
+        // per-lane pointer advancement. Keep region operations and all other
+        // layouts on their existing descriptor path.
         bool combine_data = false;
         if constexpr (channel_op == NVSHMEMI_OP_PUT && nbi && !REGION_OPERATION) {
             if (can_coalesce_warp) {
@@ -822,8 +825,9 @@ __device__ NVSHMEMI_STATIC NVSHMEMI_DEVICE_ALWAYS_INLINE void gdaki_rma_thread(
                 const __be32 first_lkey = __shfl_sync(amask, lkey, 0);
                 const __be32 first_rkey = __shfl_sync(amask, rkey, 0);
                 const int first_sysmem = __shfl_sync(amask, (int)is_data_buf_in_sysmem, 0);
+                const int first_pe = __shfl_sync(amask, dst_pe, 0);
                 combine_data = __all_sync(
-                    amask, transfer_size == first_size &&
+                    amask, dst_pe == first_pe && transfer_size == first_size &&
                                first_size <= (size_t)GDAKI_MAX_TRANSFER_SIZE / tg_size &&
                                lptr == first_lptr + (size_t)my_tid * first_size &&
                                raddr == first_raddr + (size_t)my_tid * first_size &&
